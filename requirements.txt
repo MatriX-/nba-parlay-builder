@@ -6,3 +6,4 @@ requests
 nba_api
 plotly
 rapidfuzz
+xgboost
