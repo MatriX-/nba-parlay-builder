@@ -7,3 +7,4 @@ nba_api
 plotly
 rapidfuzz
 xgboost
+scikit-learn
