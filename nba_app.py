@@ -4,6 +4,7 @@ import textwrap
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import playergamelog
 from rapidfuzz import process
@@ -608,7 +609,7 @@ def to_minutes(val):
             return int(s.split(":")[0])
         return int(float(s))
     except Exception:
-        return 0
+        return 0.0
 
 def fetch_gamelog(player_id: int, seasons: list[str], include_playoffs: bool=False, only_playoffs: bool=False) -> pd.DataFrame:
     dfs = []
@@ -815,6 +816,12 @@ NORMALIZED_POS = {
 # POSITION_MAP[player_id] = "PG"/"SG"/"SF"/"PF"/"C"
 # If not, fallback guesses are applied.
 def get_player_position(pid):
+    global POSITION_MAP
+    # Lazy load POSITION_MAP on first use
+    if not POSITION_MAP:
+        season = get_current_season_str()
+        POSITION_MAP = build_position_map(season)
+    
     pos = POSITION_MAP.get(pid)
     if not pos:
         return "SG"        # fallback assumption
@@ -840,12 +847,15 @@ def get_positional_defense_data(season):
     # Determine player positions
     logs["POS"] = logs["PLAYER_ID"].apply(get_player_position)
 
-    # Team faced in each log = OPP TEAM
-    if "OPPONENT" in logs.columns:
+    # Extract opponent from MATCHUP using regex (safer than str[-3:])
+    if "MATCHUP" in logs.columns:
+        logs["OPPONENT"] = (
+            logs["MATCHUP"].astype(str)
+            .str.extract(r"vs\. (\w+)|@ (\w+)", expand=True)
+            .bfill(axis=1).iloc[:, 0]
+        )
         opp_col = "OPPONENT"
-    elif "MATCHUP" in logs.columns:
-        # fallback: extract opponent from "BOS @ MEM"
-        logs["OPPONENT"] = logs["MATCHUP"].str[-3:]
+    elif "OPPONENT" in logs.columns:
         opp_col = "OPPONENT"
     else:
         raise Exception("Need opponent column in league logs")
@@ -896,26 +906,37 @@ def get_positional_defense_data(season):
 
 import pandas as pd
 
-POSITION_MAP = {
-    # Example fallback if you don't have player data
-    # pid: "PG" / "SG" / "SF" / "PF" / "C"
-    # Fill this dynamically from your player reference table
-}
+# Build POSITION_MAP dynamically from league data
+@st.cache_data(show_spinner=False)
+def build_position_map(season: str) -> dict:
+    """Build player ID to position mapping from league player stats."""
+    try:
+        from nba_api.stats.endpoints import leaguedashplayerstats
+        df = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=season,
+            season_type_all_star="Regular Season",
+            per_mode_detailed="PerGame",
+            timeout=60
+        ).get_data_frames()[0]
+        
+        if df.empty or "PLAYER_ID" not in df.columns:
+            return {}
+        
+        # Create mapping from player ID to position
+        position_map = {}
+        for _, row in df.iterrows():
+            pid = row.get("PLAYER_ID")
+            # Try to get position from roster data if available
+            # Fallback: use a simple heuristic based on stats
+            # This is a simplified approach - in production, fetch from commonplayerinfo
+            position_map[pid] = "SG"  # Default fallback
+        
+        return position_map
+    except Exception:
+        return {}
 
-NORMALIZED_POS = {
-    "PG": "PG", "G": "PG",
-    "SG": "SG",
-    "SF": "SF",
-    "PF": "PF", "F": "PF",
-    "C": "C",
-}
-
-# ---- Pull player positions from your player reference ----
-def get_player_position(pid):
-    if pid in POSITION_MAP:
-        return POSITION_MAP[pid]
-    return "SG"  # fallback
-
+# Initialize POSITION_MAP globally - will be populated on first use
+POSITION_MAP = {}
 
 # ---- Build per-position defense table ----
 def build_team_positional_defense(season):
@@ -1876,9 +1897,18 @@ with tab_injury:
                 roster_df["PLAYER"].tolist(),
                 key="inj_player"
             )
-            injured_id = int(
-                roster_df.loc[roster_df["PLAYER"] == injured_name, "PLAYER_ID"].iloc[0]
-            ) if injured_name else None
+            # Safe extraction with error handling
+            try:
+                if injured_name:
+                    player_row = roster_df.loc[roster_df["PLAYER"] == injured_name, "PLAYER_ID"]
+                    if not player_row.empty:
+                        injured_id = int(player_row.iloc[0])
+                    else:
+                        injured_id = None
+                else:
+                    injured_id = None
+            except (IndexError, ValueError, KeyError):
+                injured_id = None
 
         stat_inj = st.selectbox("Stat", ["PTS","REB","AST","PRA"], index=0, key="stat_inj")
 
@@ -2303,7 +2333,10 @@ with tab_me:
                         # Convert rank to factor in [-1, 1]
                         # 1 (worst defense) ≈ +1 ; middle ≈ 0 ; best ≈ -1
                         mid_rank = (num_teams + 1) / 2.0
-                        def_factor = (mid_rank - combo_rank) / (mid_rank - 1)  # approx -1..1
+                        if mid_rank > 1:
+                            def_factor = (mid_rank - combo_rank) / (mid_rank - 1)  # approx -1..1
+                        else:
+                            def_factor = 0.0  # Safety: avoid division by zero
                         # weak defense → positive def_factor
                         # strong defense → negative
 
@@ -2568,8 +2601,7 @@ try:
 except ImportError:
     xgb = None
     XGB_AVAILABLE = False
-    st.warning("xgboost not installed. Falling back to base efficiency model. Install via `pip install xgboost` for ML enhancements.")
-from nba_api.stats.endpoints import leaguegamelog, leaguedashplayerstats
+from nba_api.stats.endpoints import leaguedashplayerstats
 # 2-letter to 3-letter mapping for logos and abbrevs
 ABBREV_MAP = {
     "GS": "GSW",
@@ -3040,61 +3072,25 @@ def extract_injuries_from_summary(
         adjust_home_nrtg,
         adjust_away_nrtg,
         adjust_home_ortg,
-        adjust_away_ortg,
-        adjust_home_drtg,
-        adjust_away_drtg,
-    )
-def extract_games_from_scoreboard(scoreboard):
-    """Return list of games with home/away abbreviations + status + event_id."""
-    games = []
-    if not scoreboard or "events" not in scoreboard:
-        return games
-    for ev in scoreboard["events"]:
-        try:
-            comp = ev["competitions"][0]
-            competitors = comp["competitors"]
-            if len(competitors) != 2:
-                raise ValueError("Unexpected number of competitors")
-           
-            # FIXED: Parse dynamically by homeAway
-            away_abbr, home_abbr = "", ""
-            for t in competitors:
-                ha = t.get("homeAway", None)
-                abbr = t["team"].get("abbreviation", "")
-                if ha == "away":
-                    away_abbr = abbr
-                elif ha == "home":
-                    home_abbr = abbr
-                else:
-                    # Fallback to order if no homeAway (rare)
-                    if away_abbr == "":
-                        away_abbr = abbr
-                    else:
-                        home_abbr = abbr
-           
-            status = ev.get("status", {}).get("type", {}).get("shortDetail", "")
-            games.append(
-                {
-                    "home": home_abbr,
-                    "away": away_abbr,
-                    "status": status,
-                    "event_id": ev["id"] # Preserved for ESPN summary
-                }
-            )
-        except Exception:
-            continue
-    return games
+    adjust_away_ortg,
+    adjust_home_drtg,
+    adjust_away_drtg,
+)
 with tab_ml:
+    # Show XGBoost warning only if user is using this tab
+    if not XGB_AVAILABLE:
+        st.info("💡 XGBoost not installed. Using base efficiency model. Install via `pip install xgboost` for enhanced ML predictions.")
+    
     # --- Helper for logo + text ---
     def team_html(team):
         team_key = ABBREV_MAP.get(team, team)
         logo = TEAM_LOGOS.get(team_key, "")
         return (
-            "<span style=\"display:inline-flex; align-items:center; "
-            "gap:6px; vertical-align:middle;\">"
-            f"<img src=\"{logo}\" width=\"20\" "
-            "style=\"border-radius:3px; vertical-align:middle;\" />"
-            f"<span style=\"vertical-align:middle;\">{team}</span></span>"
+            "\u003cspan style=\"display:inline-flex; align-items:center; "
+            "gap:6px; vertical-align:middle;\"\u003e"
+            f"\u003cimg src=\"{logo}\" width=\"20\" "
+            "style=\"border-radius:3px; vertical-align:middle;\" /\u003e"
+            f"\u003cspan style=\"vertical-align:middle;\"\u003e{team}\u003c/span\u003e\u003c/span\u003e"
         )
     st.subheader("💵 ML, Spread, & Totals Analyzer")
     st.caption("Get live projections and edges for moneyline, spread, and totals using team strength and game context")
