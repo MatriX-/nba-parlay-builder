@@ -4,7 +4,6 @@ import textwrap
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import playergamelog
 from rapidfuzz import process
@@ -14,11 +13,7 @@ import requests
 from datetime import datetime, timedelta
 import pytz
 from nba_api.stats.endpoints import leaguedashplayerstats
-from shared_utils import (
-    POSITION_MAP, NORMALIZED_POS, populate_position_map,
-    get_player_position, ordinal, player_prefix, logistic_prob,
-    to_minutes, get_player_headshot, ABBREV_MAP, normalize_team_abbrev
-)
+import matplotlib.colors as mcolors
 
 
 TEAM_LOGOS = {
@@ -52,6 +47,25 @@ TEAM_LOGOS = {
     "TOR": "https://a.espncdn.com/i/teamlogos/nba/500/tor.png",
     "UTA": "https://a.espncdn.com/i/teamlogos/nba/500/utah.png",
     "WAS": "https://a.espncdn.com/i/teamlogos/nba/500/wsh.png"
+}
+
+# 2-letter to 3-letter team abbreviation mapping
+ABBREV_MAP = {
+    "GS": "GSW",
+    "NO": "NOP",
+    "UT": "UTA",
+    "SA": "SAS",
+    "LA": "LAL",
+    "NY": "NYK",
+    "WSH": "WAS",
+    # Pass-throughs for already-canonical codes
+    "GSW": "GSW",
+    "NOP": "NOP",
+    "UTA": "UTA",
+    "SAS": "SAS",
+    "LAL": "LAL",
+    "NYK": "NYK",
+    "WAS": "WAS",
 }
 
 def get_espn_scoreboard(date):
@@ -240,11 +254,42 @@ def render_espn_banner(scoreboard):
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
+def extract_games_from_scoreboard(scoreboard):
+    """Return list of games with home/away abbreviations + status + event_id."""
+    games = []
+    if not scoreboard or "events" not in scoreboard:
+        return games
 
-# extract_games_from_scoreboard is defined later with better implementation (includes event_id and ABBREV_MAP)
+    for ev in scoreboard["events"]:
+        try:
+            comp = ev["competitions"][0]
+            t_away = comp["competitors"][0]  # away
+            t_home = comp["competitors"][1]  # home
+            
+            away_abbr = t_away["team"].get("abbreviation", "")
+            home_abbr = t_home["team"].get("abbreviation", "")
+            
+            # Map 2-letter to 3-letter for consistency
+            away_abbr = ABBREV_MAP.get(away_abbr, away_abbr)
+            home_abbr = ABBREV_MAP.get(home_abbr, home_abbr)
+            
+            status = ev.get("status", {}).get("type", {}).get("shortDetail", "")
 
-# get_player_headshot is now imported from shared_utils.py
+            games.append(
+                {
+                    "home": home_abbr,
+                    "away": away_abbr,
+                    "status": status,
+                    "event_id": ev.get("id", "")
+                }
+            )
+        except Exception:
+            continue
 
+    return games
+
+def get_player_headshot(player_id):
+    return f"https://cdn.nba.com/headshots/nba/latest/260x190/{player_id}.png"
 
 
 # =========================
@@ -262,15 +307,6 @@ def fetch_scoreboard_cached(date_str):
     return get_espn_scoreboard(date_str)
 
 scoreboard = fetch_scoreboard_cached(chosen_date)
-
-
-# =========================
-# POPULATE POSITION MAP (once per session)
-# =========================
-if "positions_loaded" not in st.session_state:
-    with st.spinner("Loading player positions..."):
-        populate_position_map(season="2024-25")
-        st.session_state.positions_loaded = True
 
 # --- Render banner ---
 render_espn_banner(scoreboard)
@@ -574,7 +610,14 @@ def get_player_id(full_name: str):
     res = players.find_players_by_full_name(full_name)
     return res[0]["id"] if res else None
 
-# to_minutes function is now imported from shared_utils.py
+def to_minutes(val):
+    try:
+        s = str(val)
+        if ":" in s:
+            return int(s.split(":")[0])
+        return int(float(s))
+    except Exception:
+        return 0
 
 def fetch_gamelog(player_id: int, seasons: list[str], include_playoffs: bool=False, only_playoffs: bool=False) -> pd.DataFrame:
     dfs = []
@@ -732,6 +775,10 @@ def load_team_logs(season: str) -> pd.DataFrame:
         season=season,
         season_type_all_star="Regular Season",
         player_or_team_abbreviation="T",
+        league_id_nullable="00",
+        counter=0,
+        direction_nullable="DESC",
+        sorter_nullable="DATE",
         timeout=60
     ).get_data_frames()[0]
 
@@ -768,7 +815,24 @@ def soft_bg(hex_color, opacity=0.15):
 # BUILD POSITIONAL DEFENSE DATA FROM EXISTING LEAGUE LOGS
 # ============================================================
 
-# Position data is now imported from shared_utils.py
+# Normalize positions (ex: G → PG)
+NORMALIZED_POS = {
+    "PG": "PG", "G": "PG",
+    "SG": "SG",
+    "SF": "SF",
+    "PF": "PF", "F": "PF",
+    "C": "C",
+}
+
+# You MUST already have this available (your app does)
+# POSITION_MAP[player_id] = "PG"/"SG"/"SF"/"PF"/"C"
+# If not, fallback guesses are applied.
+def get_player_position(pid):
+    pos = POSITION_MAP.get(pid)
+    if not pos:
+        return "SG"        # fallback assumption
+    return NORMALIZED_POS.get(pos, "SG")
+
 
 def get_positional_defense_data(season):
     """
@@ -843,7 +907,68 @@ def get_positional_defense_data(season):
 # PER-POSITION TEAM DEFENSE MODULE
 # ============================================================
 
-# Position data is now imported from shared_utils.py
+import pandas as pd
+
+# Position mapping cache - populated dynamically
+POSITION_MAP = {}
+
+NORMALIZED_POS = {
+    "PG": "PG", "G": "PG", "Point Guard": "PG",
+    "SG": "SG", "Shooting Guard": "SG",
+    "SF": "SF", "Small Forward": "SF",
+    "PF": "PF", "F": "PF", "Power Forward": "PF", "Forward": "PF",
+    "C": "C", "Center": "C",
+    "F-C": "PF", "G-F": "SG", "F-G": "SF"
+}
+
+@st.cache_data(show_spinner=False, ttl=86400)  # Cache for 24 hours
+def populate_position_map(season: str):
+    """Populate POSITION_MAP from NBA API team rosters"""
+    global POSITION_MAP
+    try:
+        # Get all teams
+        all_teams = teams_static.get_teams()
+        
+        # Fetch roster for each team to get player positions
+        for team in all_teams:
+            team_id = team['id']
+            try:
+                roster_df = commonteamroster.CommonTeamRoster(
+                    team_id=team_id,
+                    season=season,
+                    timeout=30
+                ).get_data_frames()[0]
+                
+                if not roster_df.empty and 'PLAYER_ID' in roster_df.columns and 'POSITION' in roster_df.columns:
+                    for _, row in roster_df.iterrows():
+                        pid = row.get("PLAYER_ID")
+                        pos = row.get("POSITION", "")
+                        if pid and pos:
+                            # Normalize position
+                            POSITION_MAP[pid] = NORMALIZED_POS.get(pos, pos)
+            except Exception:
+                # Skip teams that fail
+                continue
+        
+    except Exception as e:
+        print(f"Warning: Could not populate POSITION_MAP: {e}")
+
+# ---- Pull player positions from your player reference ----
+def get_player_position(pid):
+    """Get player position with dynamic population"""
+    if not POSITION_MAP:
+        # Try to populate on first use
+        try:
+            current_season = get_current_season_str()
+            populate_position_map(current_season)
+        except:
+            pass
+    
+    if pid in POSITION_MAP:
+        pos = POSITION_MAP[pid]
+        return NORMALIZED_POS.get(pos, pos)
+    return "SG"  # fallback
+
 
 # ---- Build per-position defense table ----
 def build_team_positional_defense(season):
@@ -913,6 +1038,10 @@ def get_league_player_logs(season: str) -> pd.DataFrame:
         season=season,
         season_type_all_star="Regular Season",
         player_or_team_abbreviation="P",
+        league_id_nullable="00",
+        counter=0,
+        direction_nullable="DESC",
+        sorter_nullable="DATE",
     ).get_data_frames()[0]
 
     # numeric stats
@@ -1980,6 +2109,15 @@ with tab_injury:
 with tab_me:
     st.subheader("🔥 Matchup Exploiter — Auto-Detected Game Edges")
 
+    # ---------- Helpers ----------
+
+    def ordinal(n: int) -> str:
+        if 10 <= n % 100 <= 20:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+        return f"{n}{suffix}"
+
     # Thresholds for how big a trend must be to be interesting
     EDGE_THRESHOLDS = {
         "PTS":  {"strong": 4.0, "mild": 2.0},
@@ -2000,14 +2138,38 @@ with tab_me:
         "FG3M": "3PM",
     }
 
-    # Helper functions (ordinal, player_prefix, logistic_prob) are now imported from shared_utils.py
-
     def get_player_position_safe(pid):
         # You already defined get_player_position for the positional module
         try:
             return get_player_position(pid)
         except Exception:
             return "SG"
+
+    def player_prefix(name: str, stat: str) -> str:
+        """
+        Builds a bold name/stat prefix like: MITCHELL PRA
+        Handles Jr./Sr. etc.
+        """
+        tokens = name.split()
+        if len(tokens) == 1:
+            last_name = tokens[0]
+        else:
+            suffixes = {"Jr.", "Jr", "Sr.", "Sr", "II", "III", "IV"}
+            if tokens[-1] in suffixes:
+                last_name = tokens[-2] + " " + tokens[-1]
+            else:
+                last_name = tokens[-1]
+        label = STAT_PREFIX_LABEL.get(stat, stat)
+        return f"{last_name.upper()} {label.upper()}"
+
+    def logistic_prob(z: float) -> float:
+        """
+        Cheap mapping from a z-score-esque value to a probability.
+        Keeps values in a reasonable, not-too-confident range.
+        """
+        # Squeeze / clip so we never claim >95% or <5%
+        p = 0.5 + 0.18 * z
+        return float(np.clip(p, 0.05, 0.95))
 
     # --- Controls ---
     c1, c2 = st.columns([1.2, 1])
@@ -2198,7 +2360,7 @@ with tab_me:
                         # Convert rank to factor in [-1, 1]
                         # 1 (worst defense) ≈ +1 ; middle ≈ 0 ; best ≈ -1
                         mid_rank = (num_teams + 1) / 2.0
-                        def_factor = (mid_rank - combo_rank) / (mid_rank - 1) if mid_rank > 1 else 0  # approx -1..1
+                        def_factor = (mid_rank - combo_rank) / (mid_rank - 1)  # approx -1..1
                         # weak defense → positive def_factor
                         # strong defense → negative
 
@@ -2394,6 +2556,9 @@ with tab_me:
 # =========================
 # TAB 6: TEAM DEFENSE
 # =========================
+from nba_api.stats.endpoints import leaguegamelog
+from datetime import datetime
+
 # integrate this tab with main: 
 # tab_builder, tab_breakeven, tab_matchups = st.tabs(["🧮 Parlay Builder", "🧷 Breakeven", "📈 Hot Matchups"])
 
@@ -2454,8 +2619,6 @@ import requests
 import datetime
 import streamlit as st
 from nba_api.stats.endpoints import leaguegamelog, leaguedashplayerstats
-# ABBREV_MAP is now imported from shared_utils.py at the top of the file
-
 @st.cache_data(show_spinner=False)
 def load_enhanced_team_logs(season: str) -> pd.DataFrame:
     """Fetch and enhance team logs with ORTG, DRTG, NRTG."""
@@ -2464,6 +2627,10 @@ def load_enhanced_team_logs(season: str) -> pd.DataFrame:
             season=season,
             season_type_all_star="Regular Season",
             player_or_team_abbreviation="T",
+            league_id_nullable="00",
+            counter=0,
+            direction_nullable="DESC",
+            sorter_nullable="DATE",
             timeout=60
         ).get_data_frames()[0]
     except Exception:
@@ -2766,33 +2933,7 @@ def extract_injuries_from_summary(
         adjust_home_ortg,
         adjust_away_ortg,
     )
-def extract_games_from_scoreboard(scoreboard):
-    """Return list of games with home/away abbreviations + status + event_id."""
-    games = []
-    if not scoreboard or "events" not in scoreboard:
-        return games
-    for ev in scoreboard["events"]:
-        try:
-            comp = ev["competitions"][0]
-            t_away = comp["competitors"][0] # away
-            t_home = comp["competitors"][1] # home
-            away_abbr = t_away["team"].get("abbreviation", "")
-            home_abbr = t_home["team"].get("abbreviation", "")
-            # Map 2-letter to 3-letter for consistency
-            away_abbr = ABBREV_MAP.get(away_abbr, away_abbr)
-            home_abbr = ABBREV_MAP.get(home_abbr, home_abbr)
-            status = ev.get("status", {}).get("type", {}).get("shortDetail", "")
-            games.append(
-                {
-                    "home": home_abbr,
-                    "away": away_abbr,
-                    "status": status,
-                    "event_id": ev["id"]
-                }
-            )
-        except Exception:
-            continue
-    return games
+
 with tab_ml:
     # --- Helper for logo + text ---
     def team_html(team):
